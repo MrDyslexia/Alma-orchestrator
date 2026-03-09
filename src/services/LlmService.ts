@@ -5,8 +5,57 @@ import type { LlmMessage, LlmStreamChunk, LlmResponse } from '../types/services.
 
 const log = createLogger('LlmService');
 
-// Callback invocado con cada token parcial durante el streaming
 type StreamCallback = (chunk: LlmStreamChunk) => void;
+export type SentenceCallback = (sentence: string) => void;
+
+// Detecta fin de oración: .!? seguido de espacio o fin de string
+const SENTENCE_END_RE = /[.!?]+(?:\s|$)/;
+
+// ── Web Search via DuckDuckGo (sin API key) ───────────────────────
+// Usamos la API HTML de DDG que devuelve resultados sin autenticación.
+// Ideal para preguntas sobre noticias, clima, información actual.
+async function webSearch(query: string): Promise<string> {
+  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return `No se pudo buscar: HTTP ${res.status}`;
+    const data = await res.json() as any;
+
+    const parts: string[] = [];
+
+    // Abstract (Wikipedia-style summary)
+    if (data.AbstractText) parts.push(data.AbstractText);
+
+    // Answer box (conversión, definición, etc.)
+    if (data.Answer) parts.push(data.Answer);
+
+    // Resultados relacionados
+    const related: string[] = (data.RelatedTopics || [])
+      .slice(0, 4)
+      .filter((t: any) => t.Text)
+      .map((t: any) => t.Text as string);
+    if (related.length > 0) parts.push(...related);
+
+    if (parts.length === 0) return `Sin resultados para: "${query}"`;
+    return parts.join('\n').substring(0, 800);
+  } catch (e: any) {
+    return `Error en búsqueda: ${e?.message}`;
+  }
+}
+
+// Detecta si la pregunta requiere información actual/externa
+function needsSearch(text: string): boolean {
+  const lower = text.toLowerCase();
+  const triggers = [
+    'clima', 'tiempo', 'temperatura', 'lluvia', 'pronóstico',
+    'noticias', 'hoy', 'ahora', 'actualmente', 'último', 'última',
+    'quién es', 'qué es', 'cuándo', 'precio', 'dólar', 'euro',
+    'partido', 'resultado', 'ganó', 'perdió', 'juega',
+    'presidente', 'gobierno', 'elección', 'ley',
+    'qué hora', 'qué día', 'qué fecha',
+  ];
+  return triggers.some(t => lower.includes(t));
+}
 
 export class LlmService {
   private readonly baseUrl: string;
@@ -17,31 +66,42 @@ export class LlmService {
     this.model = config.LLM_MODEL;
   }
 
-  // Envía el historial de diálogo al LLM y hace streaming de la respuesta.
-  // onChunk se invoca con cada token parcial para que el orquestador
-  // pueda emitirlo al cliente Android en tiempo real.
-  // Devuelve el texto completo al finalizar.
-  async chat(messages: LlmMessage[], onChunk: StreamCallback): Promise<LlmResponse> {
+  async chat(
+    messages: LlmMessage[],
+    onChunk: StreamCallback,
+    onSentence?: SentenceCallback,
+  ): Promise<LlmResponse> {
     const startedAt = Date.now();
     let firstTokenMs: number | null = null;
 
-    log.debug(
-      { model: this.model, messages: messages.length },
-      'Iniciando llamada LLM'
-    );
+    // ── Web search si la pregunta lo necesita ─────────────────────
+    const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+    if (lastUserMsg && needsSearch(lastUserMsg.content as string)) {
+      const query = lastUserMsg.content as string;
+      console.log(`[LLM] Web search para: "${query.substring(0,60)}"`);
+      const searchResult = await webSearch(query);
+      console.log(`[LLM] Search result: "${searchResult.substring(0,100)}..."`);
+
+      // Inyectamos el resultado como contexto en el system message
+      const searchCtx: LlmMessage = {
+        role: 'system',
+        content: `Información actualizada de internet para responder la pregunta del usuario:\n${searchResult}\n\nUsa esta información en tu respuesta. Fecha actual: ${new Date().toLocaleDateString('es-CL', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.`,
+      };
+      messages = [messages[0], searchCtx, ...messages.slice(1)];
+    }
 
     const body = {
       model: this.model,
       messages,
       stream: true,
+      think: false,        // desactiva thinking en qwen3
       options: {
         num_predict: config.LLM_MAX_TOKENS,
         temperature: config.LLM_TEMPERATURE,
         top_p: 0.9,
+        num_ctx: 2048,
       },
     };
-
-    const controller = new AbortController();
 
     let response: Response;
     try {
@@ -49,48 +109,37 @@ export class LlmService {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: controller.signal,
       });
     } catch (err) {
       throw new ServiceError('llm', `No se pudo conectar con el LLM: ${String(err)}`);
     }
 
     if (!response.ok || !response.body) {
-      throw new ServiceError(
-        'llm',
-        `HTTP ${response.status}: ${response.statusText}`,
-        response.status
-      );
+      throw new ServiceError('llm', `HTTP ${response.status}: ${response.statusText}`, response.status);
     }
 
-    // Procesar stream NDJSON (newline-delimited JSON)
-    // Ollama y vLLM devuelven una línea JSON por token
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '';
+    let lineBuffer = '';
     let fullText = '';
+    let sentenceBuf = '';
 
     try {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
+        lineBuffer += decoder.decode(value, { stream: true });
 
-        // Procesar todas las líneas completas del buffer
-        let newlineIdx: number;
-        while ((newlineIdx = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newlineIdx).trim();
-          buffer = buffer.slice(newlineIdx + 1);
-
+        let nl: number;
+        while ((nl = lineBuffer.indexOf('\n')) >= 0) {
+          const line = lineBuffer.slice(0, nl).trim();
+          lineBuffer = lineBuffer.slice(nl + 1);
           if (!line) continue;
 
           let parsed: Record<string, unknown>;
-          try {
-            parsed = JSON.parse(line) as Record<string, unknown>;
-          } catch {
-            continue; // línea incompleta o inválida, ignorar
-          }
+          try { parsed = JSON.parse(line) as Record<string, unknown>; }
+          catch { continue; }
 
           const message = parsed.message as { content?: string } | undefined;
           const delta = message?.content ?? '';
@@ -98,25 +147,33 @@ export class LlmService {
           if (delta) {
             if (firstTokenMs === null) {
               firstTokenMs = Date.now() - startedAt;
-              log.debug({ firstTokenMs }, 'Primer token recibido (TTFT)');
+              log.debug({ firstTokenMs }, 'TTFT');
             }
-
             fullText += delta;
+            sentenceBuf += delta;
             onChunk({ delta, done: false });
+
+            // Detectar oraciones completas y disparar TTS en paralelo
+            if (onSentence) {
+              let match = SENTENCE_END_RE.exec(sentenceBuf);
+              while (match && match.index !== undefined) {
+                const endIdx = match.index + match[0].length;
+                const sentence = sentenceBuf.slice(0, endIdx).trim();
+                sentenceBuf = sentenceBuf.slice(endIdx).trimStart();
+                if (sentence.length > 3) onSentence(sentence);
+                match = SENTENCE_END_RE.exec(sentenceBuf);
+              }
+            }
           }
 
           if (parsed.done === true) {
+            // Fragmento final sin puntuación
+            if (onSentence && sentenceBuf.trim().length > 3) {
+              onSentence(sentenceBuf.trim());
+              sentenceBuf = '';
+            }
             onChunk({ delta: '', done: true });
-
-            log.info(
-              {
-                model: this.model,
-                chars: fullText.length,
-                ttftMs: firstTokenMs,
-                totalMs: Date.now() - startedAt,
-              },
-              'LLM completado'
-            );
+            log.info({ chars: fullText.length, ttftMs: firstTokenMs, totalMs: Date.now() - startedAt }, 'LLM OK');
           }
         }
       }
@@ -124,26 +181,15 @@ export class LlmService {
       reader.releaseLock();
     }
 
-    if (!fullText.trim()) {
-      throw new ServiceError('llm', 'El LLM devolvió una respuesta vacía');
-    }
-
-    return {
-      fullText,
-      durationMs: Date.now() - startedAt,
-    };
+    if (!fullText.trim()) throw new ServiceError('llm', 'El LLM devolvió una respuesta vacía');
+    return { fullText, durationMs: Date.now() - startedAt };
   }
 
-  // Health check
   async isHealthy(): Promise<boolean> {
     try {
-      const response = await fetch(`${this.baseUrl}/api/tags`, {
-        signal: AbortSignal.timeout(2000),
-      });
-      return response.ok;
-    } catch {
-      return false;
-    }
+      const r = await fetch(`${this.baseUrl}/api/tags`, { signal: AbortSignal.timeout(2000) });
+      return r.ok;
+    } catch { return false; }
   }
 }
 
